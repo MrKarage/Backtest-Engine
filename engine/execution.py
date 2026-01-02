@@ -7,7 +7,7 @@ class ExecutionEngine:
     def __init__(self, config: Config):
         self.config = config
 
-    def execute_order(self, order: Order, candle: Candle, positions: List[Position]) -> Tuple[List[Position], List[Trade], float]:
+    def execute_order(self, order: Order, candle: Candle, positions: List[Position], price_override: Optional[float] = None) -> Tuple[List[Position], List[Trade], float]:
         """
         Executes an order against the current candle.
         Returns:
@@ -16,8 +16,8 @@ class ExecutionEngine:
             cost: Total immediate cost (commission) incurred (exit commission is incurred now)
         """
         # 1. Determine Execution Price
-        # Default: Market Order at Open
-        base_price = candle.open
+        # Default: Market Order at Open, unless price_override is provided
+        base_price = price_override if price_override is not None else candle.open
         half_spread = (self.config.spread * self.config.pip_size) / 2.0
 
         if order.side == Side.BUY:

@@ -9,6 +9,8 @@ class Side(str, Enum):
 
 class OrderType(str, Enum):
     MARKET = "market"
+    LIMIT = "limit"
+    STOP = "stop"
 
 class Candle(BaseModel):
     time: int
@@ -24,6 +26,7 @@ class Order(BaseModel):
     side: Side
     type: OrderType
     lots: float
+    price: Optional[float] = None # Required for LIMIT and STOP
     close_position_id: Optional[str] = None
     reduce_only: bool = False
 

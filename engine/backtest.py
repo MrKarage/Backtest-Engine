@@ -1,7 +1,7 @@
 from typing import List, Optional
 import pandas as pd
 from datetime import datetime, timedelta, timezone
-from .models import Candle, Order, Config, Position, Trade, BacktestResult, Summary, EquityPoint, Side
+from .models import Candle, Order, Config, Position, Trade, BacktestResult, Summary, EquityPoint, Side, OrderType
 from .execution import ExecutionEngine
 from .accounting import calculate_swap
 import uuid
@@ -14,6 +14,7 @@ class BacktestEngine:
 
         # State
         self.positions: List[Position] = []
+        self.pending_orders: List[Order] = [] # Limit/Stop orders waiting to trigger
         self.trades: List[Trade] = []
         self.equity_curve: List[EquityPoint] = []
         self.current_balance = config.initial_balance
@@ -60,37 +61,33 @@ class BacktestEngine:
                     pass
                 last_swap_date = current_dt.date()
 
-            # 2. Process Orders
+            # 2. Process New Incoming Orders
             while order_idx < len(orders) and orders[order_idx].time <= candle.time:
                 order = orders[order_idx]
                 order_idx += 1
 
-                # Execute
-                new_positions, new_trades, cost = self.execution.execute_order(order, candle, self.positions)
+                if order.type == OrderType.MARKET:
+                    # Execute Market immediately
+                    self._execute_order(order, candle)
+                elif order.type in (OrderType.LIMIT, OrderType.STOP):
+                    # Add to Pending
+                    self.pending_orders.append(order)
 
-                # Cost is commission for this transaction.
-                # Deduct from Balance?
-                # Let's strictly follow: Balance changes only on Realized PnL events (Close).
-                # But Commission is immediate.
-                # Let's treat Commission as immediate deduction from Balance.
-                self.current_balance -= cost
+            # 3. Check Pending Orders
+            triggered_orders = []
+            remaining_orders = []
 
-                # Handle Closed Trades
-                for trade in new_trades:
-                    # Trade.gross_pnl is the price diff.
-                    # Balance += Gross PnL
-                    self.current_balance += trade.gross_pnl
-                    # Trade.swap is the swap accumulated.
-                    # Balance += Swap
-                    self.current_balance += trade.swap
-                    # Trade.commission is total commission (Entry+Exit).
-                    # We already deducted Entry comm when it opened, and Exit comm just now (in 'cost').
-                    # So we don't deduct commission again.
+            for order in self.pending_orders:
+                is_triggered, fill_price = self._check_trigger(order, candle)
+                if is_triggered:
+                    # Execute triggered order
+                    self._execute_order(order, candle, fill_price)
+                else:
+                    remaining_orders.append(order)
 
-                self.positions = new_positions
-                self.trades.extend(new_trades)
+            self.pending_orders = remaining_orders
 
-            # 3. Update Equity
+            # 4. Update Equity
             # Equity = Balance + Unrealized PnL + Unrealized Swap?
             # Wait, if we deduct Swap from Balance daily, then it's realized daily?
             # Standard: Swap is unrealized until close? Or realized daily?
@@ -116,7 +113,7 @@ class BacktestEngine:
 
             self.current_equity = self.current_balance + floating_pnl + floating_swap
 
-            # 4. Record History
+            # 5. Record History
             self.max_equity = max(self.max_equity, self.current_equity)
             dd = self.max_equity - self.current_equity
             self.max_drawdown = max(self.max_drawdown, dd)
@@ -163,3 +160,63 @@ class BacktestEngine:
             trades=self.trades,
             open_positions=self.positions
         )
+
+    def _check_trigger(self, order: Order, candle: Candle) -> tuple[bool, float]:
+        """Checks if a pending order is triggered by the candle. Returns (is_triggered, fill_price)."""
+        target_price = order.price
+        if target_price is None:
+            # Should not happen for Limit/Stop
+            return False, 0.0
+
+        if order.type == OrderType.LIMIT:
+            if order.side == Side.BUY:
+                # Buy Limit: Fill if Low <= Price
+                # If Open < Price, we gap down below limit -> Fill at Open (better price)
+                # Else if Low <= Price, fill at Price
+                if candle.open < target_price:
+                    return True, candle.open
+                elif candle.low <= target_price:
+                    return True, target_price
+            else:
+                # Sell Limit: Fill if High >= Price
+                # If Open > Price, gap up -> Fill at Open (better)
+                # Else if High >= Price, fill at Price
+                if candle.open > target_price:
+                    return True, candle.open
+                elif candle.high >= target_price:
+                    return True, target_price
+
+        elif order.type == OrderType.STOP:
+            if order.side == Side.BUY:
+                # Buy Stop: Fill if High >= Price
+                # If Open > Price, gap up -> Fill at Open (worse)
+                # Else if High >= Price, fill at Price
+                if candle.open > target_price:
+                    return True, candle.open
+                elif candle.high >= target_price:
+                    return True, target_price
+            else:
+                # Sell Stop: Fill if Low <= Price
+                # If Open < Price, gap down -> Fill at Open (worse)
+                # Else if Low <= Price, fill at Price
+                if candle.open < target_price:
+                    return True, candle.open
+                elif candle.low <= target_price:
+                    return True, target_price
+
+        return False, 0.0
+
+    def _execute_order(self, order: Order, candle: Candle, price: Optional[float] = None):
+        new_positions, new_trades, cost = self.execution.execute_order(order, candle, self.positions, price_override=price)
+
+        # Deduct cost from Balance immediately
+        self.current_balance -= cost
+
+        # Handle Closed Trades
+        for trade in new_trades:
+            self.current_balance += trade.gross_pnl
+            self.current_balance += trade.swap
+            # Comm already deducted on open and close
+
+        self.positions = new_positions
+        self.trades.extend(new_trades)
