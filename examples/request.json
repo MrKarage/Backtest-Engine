@@ -1,0 +1,24 @@
+{
+  "orders": [
+    {
+      "time": 1609459200,
+      "symbol": "EURUSD",
+      "side": "buy",
+      "type": "market",
+      "lots": 1.0
+    },
+    {
+      "time": 1609459440,
+      "symbol": "EURUSD",
+      "side": "sell",
+      "type": "market",
+      "lots": 1.0,
+      "reduce_only": true
+    }
+  ],
+  "config": {
+    "initial_balance": 10000,
+    "spread": 1.0,
+    "commission_per_lot": 5.0
+  }
+}
