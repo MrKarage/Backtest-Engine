@@ -99,6 +99,8 @@ class BacktestResult(BaseModel):
     equity_curve: List[EquityPoint]
     trades: List[Trade] # The ledger of closed trades
     open_positions: List[Position] # Remaining open positions
+    report_text_file: Optional[str] = None
+    report_chart_files: Optional[List[str]] = None
 
 class DatasetMetadata(BaseModel):
     id: str
