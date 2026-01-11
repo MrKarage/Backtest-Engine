@@ -26,6 +26,110 @@ class BacktestEngine:
     def run(self, orders: List[Order]) -> BacktestResult:
         return self._run_loop(orders)
 
+    def run_strategy(self, strategy) -> BacktestResult:
+        return self._run_strategy_loop(strategy)
+
+    def _run_strategy_loop(self, strategy):
+        strategy.on_start(self.config)
+        last_swap_date = datetime.fromtimestamp(self.candles[0].time, tz=timezone.utc).date()
+
+        for i, candle in enumerate(self.candles):
+            current_dt = datetime.fromtimestamp(candle.time, tz=timezone.utc)
+
+            # 1. Swap
+            if current_dt.date() > last_swap_date:
+                nights = (current_dt.date() - last_swap_date).days
+                for pos in self.positions:
+                    sw = calculate_swap(pos.lots, pos.side, nights, self.config)
+                    pos.swap_cost += sw
+                last_swap_date = current_dt.date()
+
+            # 2. Ask Strategy for Orders
+            new_orders = strategy.on_candle(candle, self.positions, self.pending_orders)
+
+            # Process New Orders
+            for order in new_orders:
+                # Ensure order time is set to candle time if not provided (though Order requires time)
+                # We assume Strategy sets it correctly, or we can enforce it:
+                # order.time = candle.time
+
+                if order.type == OrderType.MARKET:
+                    self._execute_order(order, candle)
+                elif order.type in (OrderType.LIMIT, OrderType.STOP):
+                    self.pending_orders.append(order)
+
+            # 3. Check Pending Orders
+            triggered_orders = []
+            remaining_orders = []
+
+            for order in self.pending_orders:
+                is_triggered, fill_price = self._check_trigger(order, candle)
+                if is_triggered:
+                    self._execute_order(order, candle, fill_price)
+                else:
+                    remaining_orders.append(order)
+
+            self.pending_orders = remaining_orders
+
+            # 4. Update Equity
+            floating_pnl = 0.0
+            floating_swap = 0.0
+            for pos in self.positions:
+                if pos.side == Side.BUY:
+                    pnl = (candle.close - pos.entry_price) * pos.lots * self.config.lot_size
+                else:
+                    pnl = (pos.entry_price - candle.close) * pos.lots * self.config.lot_size
+                floating_pnl += pnl
+                floating_swap += pos.swap_cost
+
+            self.current_equity = self.current_balance + floating_pnl + floating_swap
+
+            # 5. Record History
+            self.max_equity = max(self.max_equity, self.current_equity)
+            dd = self.max_equity - self.current_equity
+            self.max_drawdown = max(self.max_drawdown, dd)
+            dd_percent = (dd / self.max_equity) * 100 if self.max_equity > 0 else 0
+            self.max_drawdown_percent = max(self.max_drawdown_percent, dd_percent)
+
+            self.equity_curve.append(EquityPoint(
+                time=candle.time,
+                balance=self.current_balance,
+                equity=self.current_equity,
+                drawdown=dd,
+                drawdown_percent=dd_percent
+            ))
+
+        # End of Loop
+        return self._finalize_result()
+
+    def _finalize_result(self) -> BacktestResult:
+        gross_profit = sum(t.gross_pnl for t in self.trades if t.gross_pnl > 0)
+        gross_loss = sum(t.gross_pnl for t in self.trades if t.gross_pnl <= 0)
+        net_profit = self.current_equity - self.config.initial_balance
+
+        wins = [t for t in self.trades if t.net_pnl > 0]
+        losses = [t for t in self.trades if t.net_pnl <= 0]
+
+        return BacktestResult(
+            backtest_id=str(uuid.uuid4()),
+            summary=Summary(
+                net_profit=net_profit,
+                gross_profit=gross_profit,
+                gross_loss=gross_loss,
+                win_rate=len(wins)/len(self.trades) if self.trades else 0.0,
+                profit_factor=abs(gross_profit/gross_loss) if gross_loss != 0 else 0.0,
+                max_drawdown=self.max_drawdown,
+                max_drawdown_percent=self.max_drawdown_percent,
+                total_trades=len(self.trades),
+                avg_trade=sum(t.net_pnl for t in self.trades)/len(self.trades) if self.trades else 0.0,
+                avg_win=sum(t.net_pnl for t in wins)/len(wins) if wins else 0.0,
+                avg_loss=sum(t.net_pnl for t in losses)/len(losses) if losses else 0.0
+            ),
+            equity_curve=self.equity_curve,
+            trades=self.trades,
+            open_positions=self.positions
+        )
+
     def _run_loop(self, orders):
         orders.sort(key=lambda o: o.time)
         order_idx = 0
@@ -130,36 +234,8 @@ class BacktestEngine:
 
         # End of Loop
 
-        # Calculate Summary
-        gross_profit = sum(t.gross_pnl for t in self.trades if t.gross_pnl > 0)
-        gross_loss = sum(t.gross_pnl for t in self.trades if t.gross_pnl <= 0)
-        net_profit = self.current_equity - self.config.initial_balance # Based on Equity (inc open positions)?
-        # Or based on Realized Balance?
-        # Usually Summary includes open positions (mark to market).
-        # So Net Profit = Final Equity - Initial Balance.
-
-        wins = [t for t in self.trades if t.net_pnl > 0]
-        losses = [t for t in self.trades if t.net_pnl <= 0]
-
-        return BacktestResult(
-            backtest_id=str(uuid.uuid4()),
-            summary=Summary(
-                net_profit=net_profit,
-                gross_profit=gross_profit,
-                gross_loss=gross_loss,
-                win_rate=len(wins)/len(self.trades) if self.trades else 0.0,
-                profit_factor=abs(gross_profit/gross_loss) if gross_loss != 0 else 0.0,
-                max_drawdown=self.max_drawdown,
-                max_drawdown_percent=self.max_drawdown_percent,
-                total_trades=len(self.trades),
-                avg_trade=sum(t.net_pnl for t in self.trades)/len(self.trades) if self.trades else 0.0,
-                avg_win=sum(t.net_pnl for t in wins)/len(wins) if wins else 0.0,
-                avg_loss=sum(t.net_pnl for t in losses)/len(losses) if losses else 0.0
-            ),
-            equity_curve=self.equity_curve,
-            trades=self.trades,
-            open_positions=self.positions
-        )
+        # End of Loop
+        return self._finalize_result()
 
     def _check_trigger(self, order: Order, candle: Candle) -> tuple[bool, float]:
         """Checks if a pending order is triggered by the candle. Returns (is_triggered, fill_price)."""
